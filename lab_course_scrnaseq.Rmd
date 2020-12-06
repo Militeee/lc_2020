@@ -1,0 +1,579 @@
+---
+title: "A primer on computational analysis for scRNA-seq data"
+author: "Salvatore Milite"
+output: html_notebook
+---
+
+### Before starting
+
+The code and the structure of this tutorial follow with some adaptations and inclusions (and exclusions) from the [Seurat vignettes] (https://satijalab.org/seurat/vignettes.html), I suggest you to take a look at this page in case you want to understand better or learn new stuff.
+Data has been obtained from [Steele et al.](https://www.nature.com/articles/s43018-020-00121-4) and we are going to reproduce part of their analysis.
+If you are more a Python guy take a look also at [Scanpy](https://scanpy.readthedocs.io/en/stable/index.html)
+
+
+If you don't have already done it, create a new folder and download the data
+
+```{r,eval=FALSE}
+
+destfile = "./steele_data.rda"
+dir_lab = "./lab_cpurse_SC"
+
+if(!dir.exists(dir_lab)) dir.create(dir_lab)
+setwd(dir_lab)
+if(!file.exists(destfile)) download.file(url = , destfile = )
+
+curl::curl_download(url = 'http://pklab.med.harvard.edu/velocyto/mouseBM/SCG71.loom', destfile = './SCG71.loom')
+
+if (!requireNamespace("BiocManager", quietly = TRUE))
+    install.packages("BiocManager")
+
+# if reticulate asks for miniconda type yes
+install.packages(c("ggplo2", "dplyr", "RColorBrewer", "reticulate", "cowplot"))
+BiocManager::install(c("fgsea", "Seurat", "scran", "scater"))
+
+
+reticulate::py_install("leidenalg", pip = T)
+
+
+```
+
+### Load the data
+
+
+What we have here as a starting point is a dgCMatrix, an efficient way of storing sparse matrices in memory
+
+```{r}
+library(dplyr)
+
+
+load("steele_data.rda")
+data %>%  head()
+```
+From that we can create our Seurat object 
+
+```{r}
+library(Seurat)
+library(ggplot2)
+library(cowplot)
+
+seur_obj <- CreateSeuratObject(counts = data, project = "lab_course_20", min.cells = 20)
+
+seur_obj@meta.data
+```
+
+### Quality Control
+
+Now the first thing we want to do is to pre-process and filter for low quality cells. 
+We are considering as QC features:
+..* Percentage of mitochondrial counts
+..* Total number of counts
+..* Total number of genes
+Let's start by calculating the percentage of mithocondrial genes
+
+```{r}
+# We canc calculate the percentage over genes using PercentageFeatureSet
+seur_obj[["percent.mt"]] <- PercentageFeatureSet(seur_obj, pattern = "^MT-")
+
+```
+
+Usefull visualizations for quality QC are violin plots
+
+```{r}
+VlnPlot(seur_obj, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3)
+
+```
+
+Scatter plots 
+
+```{r}
+plot1 <- FeatureScatter(seur_obj, feature1 = "nCount_RNA", feature2 = "percent.mt")
+plot2 <- FeatureScatter(seur_obj, feature1 = "nCount_RNA", feature2 = "nFeature_RNA") 
+plot1 + plot2
+```
+
+and histograms
+
+```{r}
+
+plot_df <- seur_obj@meta.data %>%  as_tibble  %>% select(nCount_RNA, nFeature_RNA, percent.mt) %>%  reshape2::melt()
+
+plot_hist <- ggplot(plot_df, aes(x = value)) + geom_histogram(alpha = 0.8) + theme_bw() + facet_wrap( "variable~.", scales = "free", ncol = 1) + xlab("") + ylab("")
+
+plot_hist
+```
+
+There are a lot of cells with a low number og gense, let's zoom in that portion of the plot
+
+```{r}
+
+plot_hist + xlim(0, 1200)
+
+```
+ I would always suggest to be as permissive as possible while doing QC, you can always come back and redo the analysis with higher tresholds.
+ It can be also usefulll to visualize what we are loosing
+ 
+```{r}
+
+mt_cut <- 250
+nfeat_cut <- 12
+
+is_discarded <- (seur_obj$nFeature_RNA > 250 & seur_obj$percent.mt < 25)
+
+plot_hist + aes(fill = rep(is_discarded,3)) + scale_fill_discrete("Discarded")
+
+```
+
+Now we are ready to subset our data 
+
+```{r}
+seur_obj
+
+seur_obj <- subset(seur_obj, subset = nFeature_RNA > 200 & percent.mt < 25)
+
+##it is usefull to visualize how many cells we are left with
+seur_obj
+```
+
+We have dropped around 200 cells.
+
+### Data normalization
+
+
+To perform CPM normalization and then log(x + 1) just run  
+
+```{r}
+#seur_obj <- NormalizeData(seur_obj, normalization.method = "LogNormalize")
+```
+
+If however we want to normalize with scran we have to do a little more of work 
+
+```{r}
+library(scran)
+
+sce_data <-  as.SingleCellExperiment(seur_obj)
+
+# cluster data to have the gorup to pool
+clusters <- quickCluster(sce_data)
+
+sce_data <- computeSumFactors(sce_data, clusters=clusters)
+
+qplot(sce_data$nCount_RNA,sce_data$nFeature_RNA) + theme_bw() + xlab("Size factors") + ylab("Number of counts")
+
+#divide by normalization factors
+sce_data <- scater::normalizeCounts(sce_data, log = FALSE)
+
+```
+
+We then come back to our Seurat object and change the data matrix 
+
+```{r}
+
+# Here we have to do a bit of conversion with matrix types
+seur_obj@assays$RNA@data <- as(log(x = sce_data + 1), "dgCMatrix")
+
+```
+
+### Feature selection
+
+```{r}
+seur_obj <- FindVariableFeatures(seur_obj, selection.method = "vst", nfeatures = 2000)
+
+# Identify the 10 most highly variable genes
+top10 <- head(VariableFeatures(seur_obj), 10)
+
+# plot variable features with and without labels
+plot1 <- VariableFeaturePlot(seur_obj)
+plot2 <- LabelPoints(plot = plot1, points = top10, repel = TRUE)
+plot1 + plot2
+```
+
+
+
+### Dimensionality reduction
+
+PCA and heatmaps do usally prefer to have scaled data, we can do it by calling
+
+```{r}
+# Note that here by default we are scaling just the most variable genes, cause it is faster
+seur_obj <- ScaleData(seur_obj)
+
+# to scale everything we have to run
+##all.genes <- rownames(seur_obj)
+##seur_obj <- ScaleData(seur_obj, features = all.genes)
+
+```
+
+
+To perform the actual PCA
+
+```{r}
+seur_obj <- RunPCA(seur_obj, features = VariableFeatures(object = seur_obj))
+```
+There are different ways of visualizing PCA load ing
+
+```{r}
+# Just print them
+print(seur_obj[["pca"]], dims = 1:5, nfeatures = 5)
+
+# Or a plot of this type 
+VizDimLoadings(seur_obj, dims = 1:2, reduction = "pca")
+
+```
+
+You can still see some division in the cells in the first two dimensions
+
+```{r}
+DimPlot(seur_obj, reduction = "pca")
+
+```
+We can visualize the top markers in our dataset with an heatmap
+
+```{r}
+DimHeatmap(seur_obj, dims = 1:10, cells = 500, balanced = TRUE)
+
+```
+
+A classical way of selecting the optimal number of dimensions is to look at an elbow point in the variance explained by each component
+
+```{r}
+## Most of the times it's kinda hard to see a well defined elbow 
+ElbowPlot(seur_obj)
+
+## Let's choose 18 as the numebr of PCs, a good practice is to come back and controll that the results do not change to much if we include more dimensions
+PCs = 20
+```
+
+### Cell cycle regression
+
+First of all we are going to load some gene cycle markers from Tirosh et al, 2015 already present in Seurat.
+After that we can calculate a cell cycle specific score (average expression of the gene set usually) and regress our dataset against it.
+
+```{r}
+# if you want to perfom the alternative correction
+#seur_obj_old <- seur_obj
+
+## Load the genes
+s.genes <- cc.genes.updated.2019$s.genes
+g2m.genes <- cc.genes$g2m.genes
+
+seur_obj <- CellCycleScoring(seur_obj, s.features = s.genes, g2m.features = g2m.genes, set.ident = TRUE)
+
+RidgePlot(seur_obj, features = c("PCNA", "TOP2A", "MCM6", "MKI67"), ncol = 2)
+
+```
+
+```{r}
+
+seur_obj <- RunPCA(seur_obj, features = c(s.genes, g2m.genes), verbose = F)
+DimPlot(seur_obj)
+
+```
+
+```{r}
+seur_obj <- ScaleData(seur_obj, vars.to.regress = c("S.Score", "G2M.Score"), features = rownames(seur_obj))
+
+seur_obj <- RunPCA(seur_obj, features = c(s.genes, g2m.genes), verbose = F)
+
+DimPlot(seur_obj)
+```
+
+
+#### Alternative way
+
+Sometimes regress out the effects of cell cycle can affect in a negative way downstream analysis. So a milder way of correcting the dataset can be by regressing against the difference of S phase score and G2 score. In this way we eliminate the difference within proliferating cells, but mantainint the distiction with non-proliferating ones.
+
+```{r, eval = false}
+
+
+seur_obj_old$CC.Difference <- seur_obj_old$S.Score - seur_obj_old$G2M.Score
+seur_obj_old <- ScaleData(seur_obj_old, vars.to.regress = "CC.Difference", features = rownames(seur_obj_old))
+
+seur_obj_old <- RunPCA(seur_obj_old, features = c(s.genes, g2m.genes))
+
+DimPlot(seur_obj_old)
+
+```
+
+
+### Cell clustering 
+
+Now that you are more expert about clustering methods I can explain the algorithm sorically used by Seurat:
+-.. First of all calculate a KNN graph in PCA space, usally with Euclidean distance
+-.. Then you refine the distance based on how many neighbourds are shared by two points (Jaccard distance)
+-.. In the end we use the Louvain algorithm to cluster the data (optimizing modularity) 
+
+In 2019 a new version of the Louvain algorithm called Leiden algorithm was published on Scientific Reports, which improves over the connectivity of the clusters. This is the standard now in Scanpy and Seurat.
+
+Now let's do it in practice
+
+```{r}
+# Build the KNN graph
+seur_obj <- FindNeighbors(seur_obj, dims = 1:PCs)
+# Louvain alg
+seur_obj <- FindClusters(seur_obj, resolution = 0.3 ,algorithm = "leiden")
+
+```
+
+### Non linear dimensionality reduction
+
+To visualize our cluster let's perform some dimensionality reduction, let's start with UMAP and T-SNE
+
+```{r}
+seur_obj <- RunUMAP(seur_obj, dims = 1:PCs)
+
+DimPlot(seur_obj, reduction = "umap")
+
+```
+
+We can do the exact same process for T-sne
+
+```{r}
+
+seur_obj <- RunTSNE(seur_obj, dims = 1:PCs)
+
+DimPlot(seur_obj, reduction = "tsne")
+
+```
+
+Unfortunately diffusion maps are not implemmented by default in Seurat, we are going to calculate them for our dataset using the destiny package and the integrate the new measurement in our Seurat object
+
+```{r}
+library(destiny)
+
+df_map <-  DiffusionMap(as.SingleCellExperiment(seur_obj), n_pcs = PCs)
+
+
+seur_obj[["dm"]] <- CreateDimReducObject(embeddings = df_map@eigenvectors, key="DC_", assay=DefaultAssay(seur_obj))
+
+
+DimPlot(seur_obj, reduction = "dm")
+
+```
+
+
+### Cell type identification
+
+A good first idea is to look at some marker genes for our Leiden clusters
+
+```{r}
+seur_obj_markers <- FindAllMarkers(seur_obj, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25, test.use = "roc")
+seur_obj_markers %>% group_by(cluster) %>% top_n(n = 3, wt = avg_logFC) %>%  print()
+
+
+
+```
+
+```{r}
+VlnPlot(seur_obj, features = c("TMPO", "NASP"), slot = "data")
+
+```
+
+
+```{r}
+FeaturePlot(seur_obj, features =c("TMPO", "NASP"))
+```
+
+
+```{r}
+top10 <- seur_obj_markers %>% group_by(cluster) %>% top_n(n = 10, wt = avg_logFC)
+DoHeatmap(seur_obj, features = top10$gene) + NoLegend()
+```
+
+Now we can try to assign those clusters to known cell types
+
+```{r}
+Cell_Types <- c("Epi","T Cell","Myeloid","B Cell","Fibroblast","RBC","NK", "Endo","Acinar")
+    
+Epi_Markers <- c("KRT7","KRT8","KRT18","KRT19","EPCAM","CDH1")
+T_Cell_Markers <- c("CD3E","CD3G","CD3D","CD4","IL7R","CD8A","LEF1")
+Myeloid_Markers <- c("CD14","ITGAM","MNDA","MPEG1","ITGAX")
+B_Cell_Markers <- c("CD79A","MS4A1","CD19")
+Fibroblast_Markers <- c("CDH11","PDGFRA","PDGFRB","ACTA2")
+RBC_Markers <- c("HBA1","HBB","HBA2")
+NK_Markers <- c("NCR3","FCGR3A","NCAM1","KLRF1","KLRC1","CD38")
+Endo_Markers <- c("CDH5","PECAM1")
+Acinar_Markers <- c("TRY4","SPINK1","AMY2A")
+All_Markers <- list(Epi_Markers,T_Cell_Markers,Myeloid_Markers,B_Cell_Markers,Fibroblast_Markers,RBC_Markers,NK_Markers,Endo_Markers,Acinar_Markers)
+
+names(All_Markers) <-  Cell_Types
+
+DotPlot(seur_obj,features = All_Markers, scale = T) + theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+```
+
+```{r}
+new.cluster.ids <- c("T cells", "Acinar", "Acinar", "Myeloid", "Myeloid")
+names(new.cluster.ids) <- levels(seur_obj)
+seur_obj <- RenameIdents(seur_obj, new.cluster.ids)
+DimPlot(seur_obj, reduction = "umap", label = TRUE, pt.size = 0.5) + NoLegend()
+```
+
+
+```{r}
+plot <-  DimPlot(seur_obj, reduction = "umap", label = TRUE, pt.size = 0.5) + NoLegend()
+select.cells <- CellSelector(plot = plot)
+
+```
+
+```{r}
+select.cells
+```
+
+### DE analysis 
+
+
+```{r}
+seur_obj_DE <- FindMarkers(seur_obj, ident.1 = "Acinar", ident.2 = "T cells", only.pos = T)
+
+seur_obj_DE
+
+```
+
+```{r}
+
+DoHeatmap(seur_obj, features = rownames(seur_obj_DE %>%  arrange((p_val_adj)))[1:30])
+
+
+```
+
+There are automatic ways of doing this assignment, my favourite tool is [cellassign](https://irrationone.github.io/cellassign/articles/introduction-to-cellassign.html) but it actually requires to install tensorflow, which can be a bit of a slow and error-proe process, so I skipped it here. But if you feel enough brave definitely check it out.
+
+### Gene set enrichment analysis 
+
+Some of the code here is taken from this other (workshop) [https://crazyhottommy.github.io/scRNA-seq-workshop-Fall-2019/scRNAseq_workshop_3.html]
+
+```{r}
+library(msigdbr)
+library(fgsea)
+library(dplyr)
+library(ggplot2)
+
+msigdbr_show_species()
+
+
+```
+
+```{r}
+m_df<- msigdbr(species = "Homo sapiens", category = "C2")
+
+head(m_df)
+```
+
+
+```{r}
+fgsea_sets<- m_df %>% split(x = .$gene_symbol, f = .$gs_name)
+
+fgsea_sets$CAR_IGFBP1
+```
+
+```{r}
+
+input_GSEA <- seur_obj_DE %>%
+  arrange(desc(avg_logFC)) %>% 
+  dplyr::select(avg_logFC)
+
+
+ranks<- input_GSEA$avg_logFC
+
+names(ranks) <- rownames(input_GSEA)
+
+head(ranks)
+
+```
+
+```{r}
+fgseaRes<- fgsea(fgsea_sets, stats = ranks, scoreType = "pos", nperm = 1000)
+
+```
+```{r}
+fgseaResTidy <- fgseaRes %>%
+  as_tibble() %>%
+  arrange(desc(NES))
+
+
+fgseaResTidy %>% 
+  dplyr::select(-leadingEdge, -ES, -nMoreExtreme) %>% 
+  arrange(padj) %>% 
+  head()
+```
+
+
+```{r}
+# only plot the top 20 pathways
+ggplot(fgseaResTidy %>% filter(padj < 0.1) %>% head(n= 20), aes(reorder(pathway, NES), NES)) +
+  geom_col(aes(fill= NES < 7.5)) +
+  coord_flip() +
+  labs(x="Pathway", y="Normalized Enrichment Score",
+       title="Hallmark pathways NES from GSEA") + 
+  theme_minimal()
+```
+
+```{r}
+plotEnrichment(fgsea_sets[["SANSOM_APC_TARGETS"]],
+               ranks) + labs(title="SANSOM_APC_TARGETS")
+```
+
+
+### Trajectory inference
+
+There is a huge amount of different algorithm for trajectory inference, in a recent [benchmark] () PAGA and Slingshot were judged to be the best ones over a diverse set of benchmark datasets. While PAGA is implemented in Python, Slinghshot is written in R, so for today we are just gonna see this one. 
+Furthermore, those algorithms can be pretty slow. Thus, here we are gonna see Slingshot just for a small simulated dataset following the official vignette, but the idea and the pipelines are identical.
+
+```{r}
+# load the dataset
+library(slingshot, quietly = FALSE)
+library(RColorBrewer)
+data("slingshotExample")
+rd <- slingshotExample$rd
+cl <- slingshotExample$cl
+
+dim(rd)
+```
+
+
+```{r}
+# Fit a minimum spanning tree
+lin1 <- getLineages(rd, cl, start.clus = '1')
+plot(rd, col = brewer.pal(9,"Set1")[cl], asp = 1, pch = 16)
+lines(lin1, lwd = 3, col = 'black')
+```
+
+```{r}
+# Iterative process to fit a curve over the tree
+crv1 <- getCurves(lin1)
+
+plot(rd, col = brewer.pal(9,"Set1")[cl], asp = 1, pch = 16)
+lines(crv1, lwd = 3, col = 'black')
+```
+
+For testing associacion of genes to pseudotime I suggest this new (tool) [http://www.bioconductor.org/packages/release/bioc/html/tradeSeq.html]
+
+### RNA velocity 
+
+Here the situation is even more complex, for RNA velocity we have to rerun the (pseudo-)alignement to find spliced and unspiced sequences. As this can be computationally very demanding we are just gonna see some plotting function from the main package.
+If some of you is interested in an end-to-end tutorial of RNA velocity just ask me.
+
+```{r}
+library(Seurat)
+library(velocyto.R)
+library(SeuratWrappers)
+
+#curl::curl_download(url = 'http://pklab.med.harvard.edu/velocyto/mouseBM/SCG71.loom', destfile = './SCG71.loom')
+ldat <- ReadVelocity(file = "./SCG71.loom")
+bm <- as.Seurat(x = ldat)
+bm <- SCTransform(object = bm, assay = "spliced")
+bm <- RunPCA(object = bm, verbose = FALSE)
+bm <- FindNeighbors(object = bm, dims = 1:20)
+bm <- FindClusters(object = bm)
+bm <- RunUMAP(object = bm, dims = 1:20)
+bm <- RunVelocity(object = bm, deltaT = 1, kCells = 25, fit.quantile = 0.02)
+ident.colors <- (scales::hue_pal())(n = length(x = levels(x = bm)))
+names(x = ident.colors) <- levels(x = bm)
+cell.colors <- ident.colors[Idents(object = bm)]
+names(x = cell.colors) <- colnames(x = bm)
+show.velocity.on.embedding.cor(emb = Embeddings(object = bm, reduction = "umap"), vel = Tool(object = bm, 
+    slot = "RunVelocity"), n = 200, scale = "sqrt", cell.colors = ac(x = cell.colors, alpha = 0.5), 
+    cex = 0.8, arrow.scale = 3, show.grid.flow = TRUE, min.grid.cell.mass = 0.5, grid.n = 40, arrow.lwd = 1, 
+    do.par = FALSE, cell.border.alpha = 0.1)
+
+```
+
