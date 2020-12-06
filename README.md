@@ -4,7 +4,7 @@ Lab course 2020 material (Saur lab TUM) Bioinformatics section
 ## ScRNA-seq practical
 
 The practical will consist in an end-to-end analysis of a cancer dataset. We will skip the alignment part as it is too computationally demandind and start directly with the counts data.
-I ask you to install some specific packages and dataset, just enter in a directory were you want to run this section in your R console (either in RStudio or in the terminal)
+I ask you to install some specific package, just enter in a directory and run this section in your R console (either in RStudio or in the terminal)
 
 ```r
 destfile = "./steele_data.rda"
@@ -21,7 +21,7 @@ if (!requireNamespace("BiocManager", quietly = TRUE))
 
 # if reticulate asks for miniconda type yes
 install.packages(c("ggplo2", "dplyr", "RColorBrewer", "reticulate", "cowplot"))
-BiocManager::install(c("fgsea", "Seurat", "scran", "scater", "MAST"))
+BiocManager::install(c("fgsea", "Seurat", "scran", "scater"))
 
 
 reticulate::py_install("leidenalg", pip = T)
